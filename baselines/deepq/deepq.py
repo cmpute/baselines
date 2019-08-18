@@ -1,5 +1,8 @@
 import os
+import os.path as osp
 import tempfile
+from collections import deque
+from rtree import index as rindex
 
 import tensorflow as tf
 import zipfile
@@ -90,6 +93,97 @@ def load_act(path):
         and returns actions.
     """
     return ActWrapper.load_act(path)
+
+######### TOOLS for RL-S #########
+
+def _wrap_data(obs,action,rew,new_obs,done):
+    """
+    zhong: prepare to save the visited data
+    """
+    data = np.append(obs[0],action)
+    data = np.append(data,float(rew))
+    data = np.append(data,new_obs[0])
+    data = np.append(data,float(done))
+    return data
+
+def _extract_data(data):
+
+    return data[0:14],data[14:15],data[15:16],data[16:30],data[30:31]
+
+def _calculate_visited_times(obs,visited_state_tree):
+
+    return sum(1 for _ in visited_state_tree.intersection(obs.tolist()[0]))
+
+def _calculate_statistics_index(obs,visited_state_value,visited_state_tree,action = -1):
+    """
+    Calculate 
+    """
+    if _calculate_visited_times(obs,visited_state_tree) == 0:
+        return -1, -1, -1
+
+    value_list = [visited_state_value[idx] for idx in visited_state_tree.intersection(obs.tolist()[0])]
+    value_array_av = np.array(value_list)
+    value_array = value_array_av[:,1]
+    # value_array_rule = value_array[value_array[:,0]==0][:,1]
+    # value_array_RL = value_array
+    mean = np.mean(value_array)
+    var = np.var(value_array)
+    sigma = np.sqrt(var)
+
+    return mean,var,sigma
+
+########## TOOLS for RL-S #########
+
+
+def generate_RLS_action(obs,q_function_cz,action,
+                        visited_state_rule_value,visited_state_rule_tree,
+                        visited_state_RL_value,visited_state_RL_tree,
+                        is_training = True,
+                        visited_times_thres = 30,
+                        confidence_thres = 0.50,
+                        rule_based_safe_thres = 0.9):
+    """
+    Zhong: generate RLS action
+    """
+    RLS_action = 0
+    visited_times_rule = _calculate_visited_times(obs,visited_state_rule_tree)
+    visited_times_RL = _calculate_visited_times(obs,visited_state_RL_tree)
+
+    mean_rule, var_rule, sigma_rule = _calculate_statistics_index(obs,visited_state_rule_value,visited_state_rule_tree)
+    mean_RL, var_RL, sigma_RL = _calculate_statistics_index(obs,visited_state_RL_value,visited_state_RL_tree)
+    if is_training:
+        if visited_times_rule > visited_times_thres and visited_times_rule > visited_times_RL and mean_rule < rule_based_safe_thres:
+            RLS_action = action
+            return RLS_action
+        else:
+            RLS_action = 0
+            return RLS_action
+    else:
+        # print("rule:",visited_times_rule,mean_rule,"RL:",visited_times_RL,mean_RL)
+        # if obs[0,1] < 5:
+        #     return 0
+        # else:
+        #     return action
+        
+        if action == 0:
+            return action
+        
+        if visited_times_rule < visited_times_thres or visited_times_RL < 10 or mean_rule > -0.1:
+            RLS_action = 0
+            return RLS_action
+        
+        var_diff = var_rule/visited_times_rule + var_RL/visited_times_RL
+        sigma_diff = np.sqrt(var_diff)
+        mean_diff = mean_RL - mean_rule
+
+        z = mean_diff/sigma_diff
+        # print(action,norm.cdf(z))
+        if norm.cdf(z)>confidence_thres:
+            RLS_action = action
+        else:
+            RLS_action = 0
+
+        return RLS_action
 
 
 def learn(env,
@@ -232,6 +326,109 @@ def learn(env,
                                  initial_p=1.0,
                                  final_p=exploration_final_eps)
 
+    
+    ############################## RL-S Prepare #############################################
+    
+    # model saved name
+    saved_name = "0817"
+
+    #####
+    # Setup Training Record
+    #####
+    save_new_data = True
+    create_new_file = True
+    create_new_file_rule = create_new_file
+    save_new_data_rule = save_new_data
+
+    create_new_file_RL = True
+    save_new_data_RL = save_new_data
+    
+    create_new_file_replay_buffer = True
+    save_new_data_replay_buffer = save_new_data
+
+    is_training = True
+    trajectory_buffer = deque(maxlen=20)
+
+    if create_new_file_replay_buffer:
+        if osp.exists("recorded_replay_buffer.txt"):
+            os.remove("recorded_replay_buffer.txt")
+    else:
+        replay_buffer_dataset = np.loadtxt("recorded_replay_buffer.txt")
+        for data in replay_buffer_dataset:
+            obs, action, rew, new_obs, done = _extract_data(data)
+            replay_buffer.add(obs, action, rew, new_obs, done)
+
+    recorded_replay_buffer_outfile = open("recorded_replay_buffer.txt","a")
+    recorded_replay_buffer_format = " ".join(("%f",)*31)+"\n"
+    
+    #####
+    # Setup Rule-based Record
+    #####
+    create_new_file_rule = True
+
+    # create state database
+    if create_new_file_rule:
+        if osp.exists("state_index_rule.dat"):
+            os.remove("state_index_rule.dat")
+            os.remove("state_index_rule.idx")
+        if osp.exists("visited_state_rule.txt"):
+            os.remove("visited_state_rule.txt")
+        if osp.exists("visited_value_rule.txt"):
+            os.remove("visited_value_rule.txt")
+
+        visited_state_rule_value = []
+        visited_state_rule_counter = 0
+    else:
+        visited_state_rule_value = np.loadtxt("visited_value_rule.txt")
+        visited_state_rule_value = visited_state_rule_value.tolist()
+        visited_state_rule_counter = len(visited_state_rule_value)
+
+    visited_state_rule_outfile = open("visited_state_rule.txt", "a")
+    visited_state_format = " ".join(("%f",)*14)+"\n"
+
+    visited_value_rule_outfile = open("visited_value_rule.txt", "a")
+    visited_value_format = " ".join(("%f",)*2)+"\n"
+
+    visited_state_tree_prop = rindex.Property()
+    visited_state_tree_prop.dimension = 14
+    visited_state_dist = np.array([[0.2, 2, 10, 0.2, 2, 10, 0.2, 2, 10, 0.2, 2, 10, 0.2, 2]])
+    visited_state_rule_tree = rindex.Index('state_index_rule',properties=visited_state_tree_prop)
+
+    #####
+    # Setup RL-based Record
+    #####
+
+    if create_new_file_RL:
+        if osp.exists("state_index_RL.dat"):
+            os.remove("state_index_RL.dat")
+            os.remove("state_index_RL.idx")
+        if osp.exists("visited_state_RL.txt"):
+            os.remove("visited_state_RL.txt")
+        if osp.exists("visited_value_RL.txt"):
+            os.remove("visited_value_RL.txt")
+
+    if create_new_file_RL:
+        visited_state_RL_value = []
+        visited_state_RL_counter = 0
+    else:
+        visited_state_RL_value = np.loadtxt("visited_value_RL.txt")
+        visited_state_RL_value = visited_state_RL_value.tolist()
+        visited_state_RL_counter = len(visited_state_RL_value)
+
+    visited_state_RL_outfile = open("visited_state_RL.txt", "a")
+    visited_state_format = " ".join(("%f",)*14)+"\n"
+
+    visited_value_RL_outfile = open("visited_value_RL.txt", "a")
+    visited_value_format = " ".join(("%f",)*2)+"\n"
+
+    visited_state_tree_prop = rindex.Property()
+    visited_state_tree_prop.dimension = 14
+    visited_state_dist = np.array([[0.2, 2, 10, 0.2, 2, 10, 0.2, 2, 10, 0.2, 2, 10, 0.2, 2]])
+    visited_state_RL_tree = rindex.Index('state_index_RL',properties=visited_state_tree_prop)
+
+
+    ############################## RL-S Prepare End #############################################
+    
     # Initialize the parameters and copy them to the target network.
     U.initialize()
     update_target()
@@ -275,19 +472,108 @@ def learn(env,
                 kwargs['reset'] = reset
                 kwargs['update_param_noise_threshold'] = update_param_noise_threshold
                 kwargs['update_param_noise_scale'] = True
-            action = act(np.array(obs)[None], update_eps=update_eps, **kwargs)[0]
-            env_action = action
+            action, q_function_cz = act(np.array(obs)[None], update_eps=update_eps, **kwargs)
+            
+            RLS_action = generate_RLS_action(obs,q_function_cz,action,visited_state_rule_value,
+                                            visited_state_rule_tree,visited_state_RL_value,
+                                            visited_state_RL_tree,is_training)
+
+            env_action = RLS_action
             reset = False
             new_obs, rew, done, _ = env.step(env_action)
-            # Store transition in the replay buffer.
-            replay_buffer.add(obs, action, rew, new_obs, float(done))
-            obs = new_obs
 
-            episode_rewards[-1] += rew
+            ########### Record data in trajectory buffer and local file, but not in replay buffer ###########
+
+            trajectory_buffer.append((obs, action, float(rew), new_obs, float(done)))
+
+            # Store transition in the replay buffer.
+            # replay_buffer.add(obs, action, rew, new_obs, float(done))
+
+            obs = new_obs
+            episode_rewards[-1] += rew # safe driving is 1, collision is 0
+
+
+            while len(trajectory_buffer)>10:
+                # if safe driving for 10(can be changed) steps, the state is regarded as safe
+                obs_left, action_left, rew_left, new_obs_left, done_left = trajectory_buffer.popleft()
+                # save this state in local replay buffer file
+                if save_new_data_replay_buffer:
+                    recorded_data = _wrap_data(obs_left, action_left, rew_left, new_obs_left, done_left)
+                    recorded_replay_buffer_outfile.write(recorded_replay_buffer_format % tuple(recorded_data))
+                # put this state in replay buffer
+                replay_buffer.add(obs_left[0], action_left, float(rew_left), new_obs_left[0], float(done_left))
+                action_to_record = action_left
+                r_to_record = rew_left
+                obs_to_record = obs_left
+
+                # save this state in rule-based or RL-based visited state
+                if action_left == 0:
+                    if save_new_data_rule:
+                        visited_state_rule_value.append([action_to_record,r_to_record])
+                        visited_state_rule_tree.insert(visited_state_rule_counter,
+                            tuple((obs_to_record-visited_state_dist).tolist()[0]+(obs_to_record+visited_state_dist).tolist()[0]))
+                        visited_state_rule_outfile.write(visited_state_format % tuple(obs_to_record[0]))
+                        visited_value_rule_outfile.write(visited_value_format % tuple([action_to_record,r_to_record]))
+                        visited_state_rule_counter += 1
+                else:
+                    if save_new_data_RL:
+                        visited_state_RL_value.append([action_to_record,r_to_record])
+                        visited_state_RL_tree.insert(visited_state_RL_counter,
+                            tuple((obs_to_record-visited_state_dist).tolist()[0]+(obs_to_record+visited_state_dist).tolist()[0]))
+                        visited_state_RL_outfile.write(visited_state_format % tuple(obs_to_record[0]))
+                        visited_value_RL_outfile.write(visited_value_format % tuple([action_to_record,r_to_record]))
+                        visited_state_RL_counter += 1
+
+            ################# Record data end ########################
+            
+            
             if done:
+                """ 
+                Get collision or out of multilane map
+                """
+                ####### Record the trajectory data and add data in replay buffer #########
+                _, _, rew_right, _, _ = trajectory_buffer[-1]
+
+                while len(trajectory_buffer)>0:
+                    obs_left, action_left, rew_left, new_obs_left, done_left = trajectory_buffer.popleft()
+                    action_to_record = action_left
+                    r_to_record = (rew_right-rew_left)*gamma**len(trajectory_buffer) + rew_left
+                    # record in local replay buffer file
+                    if save_new_data_replay_buffer:
+                        obs_to_record = obs_left
+                        recorded_data = _wrap_data(obs_left, action_left, r_to_record, new_obs_left, done_left)
+                        recorded_replay_buffer_outfile.write(recorded_replay_buffer_format % tuple(recorded_data))
+                    # record in replay buffer for trainning
+                    replay_buffer.add(obs_left[0], action_left, float(r_to_record), new_obs_left[0], float(done_left))
+
+                    # save visited rule/RL state data in local file
+                    if action_left == 0:
+                        if save_new_data_rule:
+                            visited_state_rule_value.append([action_to_record,r_to_record])
+                            visited_state_rule_tree.insert(visited_state_rule_counter,
+                                tuple((obs_to_record-visited_state_dist).tolist()[0]+(obs_to_record+visited_state_dist).tolist()[0]))
+                            visited_state_rule_outfile.write(visited_state_format % tuple(obs_to_record[0]))
+                            visited_value_rule_outfile.write(visited_value_format % tuple([action_to_record,r_to_record]))
+                            visited_state_rule_counter += 1
+                    else:
+                        if save_new_data_RL:
+                            visited_state_RL_value.append([action_to_record,r_to_record])
+                            visited_state_RL_tree.insert(visited_state_RL_counter,
+                                tuple((obs_to_record-visited_state_dist).tolist()[0]+(obs_to_record+visited_state_dist).tolist()[0]))
+                            visited_state_RL_outfile.write(visited_state_format % tuple(obs_to_record[0]))
+                            visited_value_RL_outfile.write(visited_value_format % tuple([action_to_record,r_to_record]))
+                            visited_state_RL_counter += 1
+
+                ####### Recorded #####
+
                 obs = env.reset()
                 episode_rewards.append(0.0)
                 reset = True
+
+            ############### Trainning Part Start #####################
+            if not is_training:
+                # don't need to train the model
+                continue
 
             if t > learning_starts and t % train_freq == 0:
                 # Minimize the error in Bellman's equation on a batch sampled from replay buffer.
@@ -324,6 +610,19 @@ def learn(env,
                     save_variables(model_file)
                     model_saved = True
                     saved_mean_reward = mean_100ep_reward
+
+                    rew_str = str(mean_100ep_reward)
+                    path = osp.expanduser("~/models/carlaok_checkpoint/"+saved_name+"_"+rew_str)
+                    act.save(path)
+
+        #### close the file ####
+        visited_state_rule_outfile.close()
+        visited_value_rule_outfile.close()
+        recorded_replay_buffer_outfile.close()
+        if not is_training:
+            testing_record_outfile.close()
+        #### close the file ###
+
         if model_saved:
             if print_freq is not None:
                 logger.log("Restored model with mean reward: {}".format(saved_mean_reward))
