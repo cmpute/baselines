@@ -335,18 +335,18 @@ def learn(env,
     #####
     # Setup Training Record
     #####
-    save_new_data = True
-    create_new_file = True
+    save_new_data = False
+    create_new_file = False
     create_new_file_rule = create_new_file
     save_new_data_rule = save_new_data
 
-    create_new_file_RL = True
+    create_new_file_RL = False
     save_new_data_RL = save_new_data
     
-    create_new_file_replay_buffer = True
+    create_new_file_replay_buffer = False
     save_new_data_replay_buffer = save_new_data
 
-    is_training = True
+    is_training = False
     trajectory_buffer = deque(maxlen=20)
 
     if create_new_file_replay_buffer:
@@ -474,9 +474,11 @@ def learn(env,
                 kwargs['update_param_noise_scale'] = True
             action, q_function_cz = act(np.array(obs)[None], update_eps=update_eps, **kwargs)
             
-            RLS_action = generate_RLS_action(obs,q_function_cz,action,visited_state_rule_value,
-                                            visited_state_rule_tree,visited_state_RL_value,
-                                            visited_state_RL_tree,is_training)
+            # RLS_action = generate_RLS_action(obs,q_function_cz,action,visited_state_rule_value,
+            #                                 visited_state_rule_tree,visited_state_RL_value,
+            #                                 visited_state_RL_tree,is_training)
+
+            RLS_action = 0
 
             env_action = RLS_action
             reset = False
